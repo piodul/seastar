@@ -117,8 +117,10 @@ public:
     using value_tuple_type = typename future_type::tuple_type;
 private:
     /// \cond internal
-    class shared_state : public enable_lw_shared_from_this<shared_state> {
+    class shared_state final : public enable_lw_shared_from_this<shared_state>, public task {
         future_type _original_future;
+        // Ensures that shared_state is alive until run_and_dispose() runs (if the task was scheduled)
+        lw_shared_ptr<shared_state> _keepaliver;
         struct entry {
             promise_type pr;
             std::optional<abort_on_expiry<clock>> timer;
@@ -146,8 +148,7 @@ private:
             }
         }
         explicit shared_state(future_type f) noexcept : _original_future(std::move(f)) { }
-        void resolve(future_type&& f) noexcept {
-            _original_future = std::move(f);
+        virtual void run_and_dispose() noexcept override {
             auto& state = _original_future._state;
             if (_original_future.failed()) {
                 while (_peers) {
@@ -165,6 +166,11 @@ private:
                     _peers.pop_front();
                 }
             }
+            _keepaliver.release();
+        }
+
+        virtual task* waiting_task() noexcept override {
+            return nullptr;
         }
 
         future_type get_future(time_point timeout = time_point::max()) noexcept {
@@ -184,11 +190,9 @@ private:
                     abort_source& as = e.timer->abort_source();
                    _peers.make_back_abortable(as);
                 }
-                if (_original_future._state.valid()) {
-                    // _original_future's result is forwarded to each peer.
-                    (void)_original_future.then_wrapped([s = this->shared_from_this()] (future_type&& f) mutable {
-                        s->resolve(std::move(f));
-                    });
+                if (!_keepaliver) {
+                    _original_future.set_task(*this);
+                    _keepaliver = this->shared_from_this();
                 }
                 return f;
             } else if (_original_future.failed()) {
@@ -211,11 +215,9 @@ private:
 
                 auto f = e.pr.get_future();
                 _peers.make_back_abortable(as);
-                if (_original_future._state.valid()) {
-                    // _original_future's result is forwarded to each peer.
-                    (void)_original_future.then_wrapped([s = this->shared_from_this()] (future_type&& f) mutable {
-                        s->resolve(std::move(f));
-                    });
+                if (!_keepaliver) {
+                    _original_future.set_task(*this);
+                    _keepaliver = this->shared_from_this();
                 }
                 return f;
             } else if (_original_future.failed()) {
